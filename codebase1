@@ -1,0 +1,379 @@
+# GMD Automation Implementation Plan
+
+## 1. Environment Setup
+
+```python
+# Required packages
+pip install playwright pandas python-docx openpyxl Office365-REST-Python-Client
+playwright install  # Install browser binaries
+```
+
+## 2. Project Structure
+
+```
+gmd-automation/
+├── config.py           # Configuration settings and credentials
+├── main.py             # Main script orchestrating the workflow
+├── gmd_crawler.py      # GMD platform interaction
+├── sharepoint.py       # SharePoint document retrieval
+├── data_processor.py   # Process extracted data and merge into validation reports
+├── utils.py            # Utility functions
+└── requirements.txt    # Project dependencies
+```
+
+## 3. Detailed Implementation Steps
+
+### Step 1: Build GMD Web Crawler
+
+The crawler will:
+1. Log into the GMD platform
+2. Navigate to the specific model
+3. Initiate export of model data
+4. Download the Excel file
+
+Here's how you could implement it:
+
+```python
+# gmd_crawler.py
+from playwright.sync_api import sync_playwright
+import time
+import os
+from config import GMD_URL, GMD_USERNAME, GMD_PASSWORD
+
+class GMDCrawler:
+    def __init__(self):
+        self.download_path = os.path.join(os.getcwd(), "downloads")
+        if not os.path.exists(self.download_path):
+            os.makedirs(self.download_path)
+
+    def extract_model_data(self, model_id):
+        """Extract data for a specific model from GMD platform"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                accept_downloads=True,
+                downloads_path=self.download_path
+            )
+            page = context.new_page()
+            
+            # Login to GMD
+            print("Logging into GMD...")
+            page.goto(GMD_URL)
+            page.fill('#username', GMD_USERNAME)
+            page.fill('#password', GMD_PASSWORD)
+            page.click('button[type="submit"]')
+            
+            # Wait for login to complete
+            page.wait_for_selector('your-dashboard-selector')
+            
+            # Navigate to model page
+            print(f"Navigating to model {model_id}...")
+            page.goto(f"{GMD_URL}/models/{model_id}")
+            page.wait_for_selector('model-details-selector')
+            
+            # Click export button
+            print("Exporting model data...")
+            page.click('export-button-selector')
+            
+            # Wait for download to complete
+            download = page.wait_for_download()
+            download_path = download.path()
+            
+            # Save file with model ID in name
+            target_path = os.path.join(self.download_path, f"gmd_extract_{model_id}_{time.strftime('%Y%m%d')}.xlsx")
+            download.save_as(target_path)
+            
+            browser.close()
+            print(f"GMD data extracted to {target_path}")
+            return target_path
+```
+
+### Step 2: SharePoint Integration
+
+This component will retrieve the latest validation report from SharePoint:
+
+```python
+# sharepoint.py
+from office365.runtime.auth.authentication_context import AuthenticationContext
+from office365.sharepoint.client_context import ClientContext
+from office365.sharepoint.files.file import File
+import os
+from config import SHAREPOINT_URL, SHAREPOINT_USERNAME, SHAREPOINT_PASSWORD
+
+class SharePointConnector:
+    def __init__(self):
+        self.ctx = self._get_context()
+        self.download_path = os.path.join(os.getcwd(), "downloads")
+        if not os.path.exists(self.download_path):
+            os.makedirs(self.download_path)
+
+    def _get_context(self):
+        """Connect to SharePoint"""
+        auth_context = AuthenticationContext(SHAREPOINT_URL)
+        auth_context.acquire_token_for_user(SHAREPOINT_USERNAME, SHAREPOINT_PASSWORD)
+        return ClientContext(SHAREPOINT_URL, auth_context)
+
+    def get_latest_validation_report(self, model_id):
+        """Get latest validation report for a specific model"""
+        print(f"Looking for latest validation report for model {model_id}...")
+        
+        # Define the folder path where validation reports are stored
+        folder_path = f"/sites/YourSite/Shared Documents/Validation Reports/{model_id}"
+        
+        # Get all files in the folder
+        folder = self.ctx.web.get_folder_by_server_relative_url(folder_path)
+        files = folder.files
+        self.ctx.load(files)
+        self.ctx.execute_query()
+        
+        # Find latest file by creation date
+        latest_file = None
+        latest_date = None
+        
+        for file in files:
+            # Only consider validation report files
+            if "validation" in file.properties["Name"].lower() and file.properties["Name"].endswith((".docx", ".pdf")):
+                file_date = file.properties["TimeCreated"]
+                if latest_date is None or file_date > latest_date:
+                    latest_date = file_date
+                    latest_file = file
+        
+        if latest_file is None:
+            raise FileNotFoundError(f"No validation report found for model {model_id}")
+        
+        # Download the latest file
+        file_name = latest_file.properties["Name"]
+        file_url = latest_file.properties["ServerRelativeUrl"]
+        local_path = os.path.join(self.download_path, file_name)
+        
+        with open(local_path, "wb") as file_handle:
+            File.open_binary(self.ctx, file_url).execute_query().copy_to(file_handle)
+        
+        print(f"Downloaded latest validation report: {file_name}")
+        return local_path
+```
+
+### Step 3: Data Processing and Integration
+
+This component will process the GMD extract and merge data into the validation report:
+
+```python
+# data_processor.py
+import pandas as pd
+from docx import Document
+import re
+import os
+from config import FIELD_MAPPINGS
+
+class DataProcessor:
+    def __init__(self):
+        self.output_path = os.path.join(os.getcwd(), "output")
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path)
+
+    def process_gmd_extract(self, excel_path):
+        """Process GMD extract Excel file and extract relevant information"""
+        print(f"Processing GMD extract: {excel_path}")
+        df = pd.read_excel(excel_path)
+        
+        # Extract relevant information based on your requirements
+        # This is where you'll implement your specific data extraction logic
+        model_data = {}
+        
+        for field, column in FIELD_MAPPINGS.items():
+            if column in df.columns:
+                # Handle different types of fields
+                if field == "model_id":
+                    model_data[field] = df[column].iloc[0]
+                elif field == "validation_dates":
+                    model_data[field] = df[column].tolist()
+                else:
+                    model_data[field] = df[column].iloc[0]
+        
+        return model_data
+
+    def update_validation_report(self, report_path, model_data):
+        """Update validation report with data from GMD extract"""
+        print(f"Updating validation report: {report_path}")
+        
+        file_ext = os.path.splitext(report_path)[1].lower()
+        
+        if file_ext == ".docx":
+            return self._update_word_report(report_path, model_data)
+        elif file_ext == ".pdf":
+            raise NotImplementedError("PDF updating not implemented yet")
+        else:
+            raise ValueError(f"Unsupported file format: {file_ext}")
+
+    def _update_word_report(self, report_path, model_data):
+        """Update Word document validation report"""
+        doc = Document(report_path)
+        
+        # Create a new file name for the updated report
+        file_name = os.path.basename(report_path)
+        base_name, ext = os.path.splitext(file_name)
+        new_file_path = os.path.join(self.output_path, f"{base_name}_updated{ext}")
+        
+        # Placeholder patterns to look for in the document
+        # Adjust these patterns based on your actual document structure
+        placeholders = {
+            "MODEL_ID": model_data.get("model_id", ""),
+            "MODEL_NAME": model_data.get("model_name", ""),
+            "MODEL_OWNER": model_data.get("model_owner", ""),
+            "VALIDATION_DATE": model_data.get("validation_date", ""),
+            # Add more placeholders as needed
+        }
+        
+        # Replace placeholders in paragraphs
+        for paragraph in doc.paragraphs:
+            for key, value in placeholders.items():
+                placeholder = f"[{key}]"
+                if placeholder in paragraph.text:
+                    paragraph.text = paragraph.text.replace(placeholder, str(value))
+        
+        # Replace placeholders in tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for key, value in placeholders.items():
+                        placeholder = f"[{key}]"
+                        if placeholder in cell.text:
+                            cell.text = cell.text.replace(placeholder, str(value))
+        
+        # Save the updated document
+        doc.save(new_file_path)
+        print(f"Updated validation report saved to: {new_file_path}")
+        
+        return new_file_path
+```
+
+### Step 4: Configuration Settings
+
+```python
+# config.py
+# GMD Platform credentials
+GMD_URL = "https://your-gmd-platform.com"
+GMD_USERNAME = "your_username"
+GMD_PASSWORD = "your_password"  # Store securely in production
+
+# SharePoint configuration
+SHAREPOINT_URL = "https://yourbank.sharepoint.com/sites/your-site"
+SHAREPOINT_USERNAME = "your_sharepoint_username"
+SHAREPOINT_PASSWORD = "your_sharepoint_password"  # Store securely in production
+
+# Field mappings for data extraction
+FIELD_MAPPINGS = {
+    "model_id": "Model ID",
+    "model_name": "Model Name",
+    "model_owner": "Owner",
+    "validation_date": "Last Validation Date",
+    # Add more mappings as needed
+}
+```
+
+### Step 5: Main Orchestration Script
+
+```python
+# main.py
+import argparse
+import os
+import logging
+from gmd_crawler import GMDCrawler
+from sharepoint import SharePointConnector
+from data_processor import DataProcessor
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("gmd_automation.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def main():
+    parser = argparse.ArgumentParser(description='GMD Automation Tool')
+    parser.add_argument('--model-id', required=True, help='Model ID to process')
+    args = parser.parse_args()
+    
+    model_id = args.model_id
+    logger.info(f"Starting GMD automation process for model {model_id}")
+    
+    try:
+        # Step 1: Extract data from GMD
+        crawler = GMDCrawler()
+        gmd_extract_path = crawler.extract_model_data(model_id)
+        logger.info(f"GMD extract downloaded to {gmd_extract_path}")
+        
+        # Step 2: Get latest validation report from SharePoint
+        sharepoint = SharePointConnector()
+        validation_report_path = sharepoint.get_latest_validation_report(model_id)
+        logger.info(f"Latest validation report downloaded to {validation_report_path}")
+        
+        # Step 3: Process data and update validation report
+        processor = DataProcessor()
+        model_data = processor.process_gmd_extract(gmd_extract_path)
+        updated_report_path = processor.update_validation_report(validation_report_path, model_data)
+        logger.info(f"Updated validation report saved to {updated_report_path}")
+        
+        logger.info("Process completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error occurred: {str(e)}", exc_info=True)
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    exit(main())
+```
+
+### Step 6: Running the Automation
+
+To run the automation for a specific model:
+
+```
+python main.py --model-id MODEL123
+```
+
+## 4. Error Handling and Security Considerations
+
+1. **Error Handling**: Implement proper error handling for:
+   - Network connectivity issues
+   - Invalid credentials
+   - Missing files
+   - Unsupported document formats
+
+2. **Security Best Practices**:
+   - Do not hardcode credentials in the source code
+   - Use environment variables or a secure vault for storing credentials
+   - Implement logging but ensure sensitive information isn't logged
+
+3. **Rate Limiting**:
+   - Add delays between web actions to avoid overloading servers
+   - Implement retry logic for transient errors
+
+## 5. Potential Enhancements
+
+1. **User Interface**: Build a simple GUI with Tkinter or a web interface with Flask/FastAPI
+2. **Scheduled Runs**: Configure automatic runs on a schedule
+3. **Email Notifications**: Send email notifications upon completion or errors
+4. **Multi-Model Support**: Process multiple models in batch
+5. **Logging & Monitoring**: Implement comprehensive logging and monitoring
+
+## 6. Testing Strategy
+
+1. **Unit Testing**: Test individual components in isolation
+2. **Integration Testing**: Test the interaction between components
+3. **End-to-End Testing**: Test the entire workflow
+4. **Mock Testing**: Use mocks for external services during development
+
+## 7. Implementation Timeline
+
+1. **Phase 1** (Week 1): Environment setup and basic framework
+2. **Phase 2** (Week 2): GMD crawler implementation
+3. **Phase 3** (Week 3): SharePoint integration
+4. **Phase 4** (Week 4): Data processing and document updating
+5. **Phase 5** (Week 5): Testing, refinement, and documentation
